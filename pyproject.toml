@@ -1,0 +1,27 @@
+[project]
+name = "rl-ideas"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flax>=0.12.7",
+    "gymnasium[box2d]>=1.2.2",
+    "jax>=0.8.1",
+    "jaxlib>=0.8.1",
+    "matplotlib>=3.10.7",
+    "moviepy>=2.2.1",
+    "numpy>=2.3.5",
+    "optax>=0.2.6",
+]
+
+[tool.ruff]
+indent-width = 2
+
+[tool.ruff.format]
+indent-style = "space"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.5",
+]
