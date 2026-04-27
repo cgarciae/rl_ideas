@@ -24,7 +24,7 @@ class Config:
   hidden_dim: int = 256
   batch_size: int = 512
   # Phase 1: initial random seed
-  num_random_episodes: int = 2000
+  num_random_episodes: int = 200
   # Phase 3: SFT training per iteration
   train_steps_per_iter: int = 50
   dropout_rate: float = 0.1
@@ -32,6 +32,9 @@ class Config:
   num_rollout_episodes: int = 50
   temperature: float = 1.0
   elite_fraction: float = 0.3
+  percent_training: float = 0.3
+  random_eviction_fraction: float = 0.0
+  discard_previous: bool = False
   # Phase 5: buffer management
   cull_fraction: float = 0.05
   max_buffer_trajectories: int = 2000
@@ -67,24 +70,31 @@ class Trajectory:
 
 # --- Sorted Replay Buffer ---
 class SortedBuffer:
+  _flat_states: np.ndarray
+  _flat_actions: np.ndarray
+  _flat_rtgs: np.ndarray
+
   def __init__(self, max_trajectories: int):
     self.trajectories: list[Trajectory] = []
     self.max_trajectories = max_trajectories
-    self._flat_states: np.ndarray = None
-    self._flat_actions: np.ndarray = None
-    self._flat_rtgs: np.ndarray = None
-    self._dirty: bool = True
 
-  def add_batch(self, new_trajectories: list[Trajectory]):
+  def add_batch(self, new_trajectories: list[Trajectory], np_rng: np.random.Generator = None, random_eviction_fraction: float = 0.0, discard_previous: bool = False):
+    if discard_previous:
+      self.trajectories = []
+      self._dirty = True
+    N = len(new_trajectories)
+    S = self.max_trajectories - len(self.trajectories)
+    if S < N:
+      n_to_delete = N - S
+      n_random = round(n_to_delete * random_eviction_fraction)
+      n_worst = n_to_delete - n_random
+      if n_random > 0 and np_rng is not None:
+        random_indices = set(np_rng.choice(len(self.trajectories), size=n_random, replace=False).tolist())
+        self.trajectories = [t for i, t in enumerate(self.trajectories) if i not in random_indices]
+      if n_worst > 0:
+        del self.trajectories[-n_worst:]
     self.trajectories.extend(new_trajectories)
     self.trajectories.sort(key=lambda t: t.total_reward, reverse=True)
-    if len(self.trajectories) > self.max_trajectories:
-      self.trajectories = self.trajectories[: self.max_trajectories]
-    self._dirty = True
-
-  def cull(self, fraction: float):
-    keep = max(1, int(len(self.trajectories) * (1.0 - fraction)))
-    self.trajectories = self.trajectories[:keep]
     self._dirty = True
 
   def _rebuild_flat(self):
@@ -117,13 +127,26 @@ class SortedBuffer:
     r_min: float,
     r_max: float,
     np_rng: np.random.Generator,
+    top_fraction: float = 1.0,
   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    self._rebuild_flat()
-    n = len(self._flat_states)
+    if top_fraction < 1.0:
+      n_elite = max(1, int(len(self.trajectories) * top_fraction))
+      states, actions, rtgs = [], [], []
+      for t in self.trajectories[:n_elite]:
+        states.extend(t.states)
+        actions.extend(t.actions)
+        rtgs.extend(t.rtgs)
+      flat_states = np.array(states, dtype=np.float32)
+      flat_actions = np.array(actions, dtype=np.int32)
+      flat_rtgs = np.array(rtgs, dtype=np.float32)
+    else:
+      self._rebuild_flat()
+      flat_states, flat_actions, flat_rtgs = self._flat_states, self._flat_actions, self._flat_rtgs
+    n = len(flat_states)
     indices = np_rng.choice(n, size=batch_size, replace=batch_size > n)
     denom = r_max - r_min if r_max != r_min else 1.0
-    rtg_norms = np.clip((self._flat_rtgs[indices] - r_min) / denom, 0.0, 1.0)
-    return self._flat_states[indices], self._flat_actions[indices], rtg_norms
+    rtg_norms = np.clip((flat_rtgs[indices] - r_min) / denom, 0.0, 1.0)
+    return flat_states[indices], flat_actions[indices], rtg_norms
 
   def __len__(self):
     return len(self.trajectories)
@@ -198,8 +221,8 @@ def rollout_episode(
   state, _ = env.reset()
   done = False
   states, actions, rewards, frames = [], [], [], []
-  rtg_remaining = rtg_target
   denom = r_max - r_min if r_max != r_min else 1.0
+  rtg_remaining = r_min + rtg_target * denom
 
   while not done:
     rtg_norm = float(np.clip((rtg_remaining - r_min) / denom, 0.0, 1.0))
@@ -242,7 +265,8 @@ def evaluate(
   env = gym.make(config.env_name, render_mode="rgb_array")
   np_rng = np.random.default_rng(config.seed + iteration * 1000)
 
-  rtg_target = float(np.max(elite_total_rewards))
+  denom = r_max - r_min if r_max != r_min else 1.0
+  rtg_target = float(np.clip((np.max(elite_total_rewards) - r_min) / denom, 0.0, 1.0))
   rewards = []
   best_reward = -float("inf")
   best_frames: list = []
@@ -286,9 +310,11 @@ class LivePlotter:
 
     if render:
       plt.ion()
-    self.fig, (self.ax_reward, self.ax_dist) = plt.subplots(1, 2, figsize=(14, 5))
+    self.fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    (self.ax_reward, self.ax_dist) = axes[0]
+    (self.ax_loss, self.ax_curve) = axes[1]
 
-    # Left: rollout episode rewards with EMA
+    # Upper-left: rollout episode rewards with EMA
     self.scatter = self.ax_reward.scatter(
       [], [], c="b", alpha=0.3, s=10, label="Episode Reward"
     )
@@ -300,14 +326,54 @@ class LivePlotter:
     self.ax_reward.spines["top"].set_visible(False)
     self.ax_reward.spines["right"].set_visible(False)
 
-    # Right: RTG distribution of current buffer
+    # Upper-right: RTG distribution of current buffer
     self.ax_dist.set_xlabel("Total Episode Reward (RTG₀)")
     self.ax_dist.set_ylabel("Count")
     self.ax_dist.set_title("Buffer RTG Distribution")
     self.ax_dist.spines["top"].set_visible(False)
     self.ax_dist.spines["right"].set_visible(False)
 
+    # Lower-left: fine-tuning loss
+    self.loss_iterations: list[int] = []
+    self.loss_values: list[float] = []
+    (self.loss_line,) = self.ax_loss.plot([], [], "r", linewidth=1.5)
+    self.ax_loss.set_xlabel("Iteration")
+    self.ax_loss.set_ylabel("Loss")
+    self.ax_loss.set_title("Fine-tuning Loss")
+    self.ax_loss.spines["top"].set_visible(False)
+    self.ax_loss.spines["right"].set_visible(False)
+
+    # Lower-right: per-step loss curve for current fine-tuning phase
+    (self.loss_curve_line,) = self.ax_curve.plot([], [], "r", linewidth=1.0, alpha=0.8)
+    self.ax_curve.set_xlabel("Step")
+    self.ax_curve.set_ylabel("Loss")
+    self.ax_curve.set_title("Fine-tuning Loss (current iteration)")
+    self.ax_curve.spines["top"].set_visible(False)
+    self.ax_curve.spines["right"].set_visible(False)
+
     self.fig.tight_layout()
+
+  def update_loss_curve(self, losses: list[float]):
+    steps = list(range(1, len(losses) + 1))
+    self.loss_curve_line.set_xdata(steps)
+    self.loss_curve_line.set_ydata(losses)
+    self.ax_curve.set_xlim(1, len(losses))
+    self.ax_curve.relim()
+    self.ax_curve.autoscale_view()
+    if self.render:
+      self.fig.canvas.draw()
+      self.fig.canvas.flush_events()
+
+  def update_losses(self, iteration: int, losses: list[float]):
+    self.loss_iterations.append(iteration)
+    self.loss_values.append(float(np.mean(losses)))
+    self.loss_line.set_xdata(self.loss_iterations)
+    self.loss_line.set_ydata(self.loss_values)
+    self.ax_loss.relim()
+    self.ax_loss.autoscale_view()
+    if self.render:
+      self.fig.canvas.draw()
+      self.fig.canvas.flush_events()
 
   def update_rewards(self, iteration: int, episode_rewards: list[float]):
     self.iterations_scatter.extend([iteration] * len(episode_rewards))
@@ -337,25 +403,37 @@ class LivePlotter:
       self.fig.canvas.draw()
       self.fig.canvas.flush_events()
 
-  def update_distribution(self, total_rewards: np.ndarray):
+  def update_distribution(
+    self,
+    total_rewards: np.ndarray,
+    elite_cutoff: float | None = None,
+    p50_elite: float | None = None,
+  ):
     self.ax_dist.cla()
     self.ax_dist.hist(
       total_rewards, bins=50, color="steelblue", alpha=0.7, edgecolor="none"
     )
 
-    p50 = float(np.percentile(total_rewards, 50))
-    p90 = float(np.percentile(total_rewards, 90))
     p_max = float(np.max(total_rewards))
-
-    self.ax_dist.axvline(
-      p50, color="orange", linestyle="--", linewidth=1.5, label=f"P50={p50:.0f}"
-    )
-    self.ax_dist.axvline(
-      p90, color="red", linestyle="--", linewidth=1.5, label=f"P90={p90:.0f}"
-    )
     self.ax_dist.axvline(
       p_max, color="green", linestyle="--", linewidth=1.5, label=f"Max={p_max:.0f}"
     )
+    if elite_cutoff is not None:
+      self.ax_dist.axvline(
+        elite_cutoff,
+        color="orange",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"Elite cutoff={elite_cutoff:.0f}",
+      )
+    if p50_elite is not None:
+      self.ax_dist.axvline(
+        p50_elite,
+        color="red",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"P50 elite={p50_elite:.0f}",
+      )
 
     self.ax_dist.set_xlabel("Total Episode Reward (RTG₀)")
     self.ax_dist.set_ylabel("Count")
@@ -422,7 +500,7 @@ def main():
     losses = []
     for _ in range(config.train_steps_per_iter):
       states_b, actions_b, rtg_norms_b = buffer.sample_transitions(
-        config.batch_size, r_min, r_max, np_rng
+        config.batch_size, r_min, r_max, np_rng, top_fraction=config.percent_training
       )
       loss = train_step(
         model,
@@ -437,28 +515,31 @@ def main():
     # Phase 4: Optimistic Rollout
     elite_rewards = buffer.get_elite_total_rewards(config.elite_fraction)
     p50_elite = float(np.percentile(elite_rewards, 50))
-    p100_elite = float(np.max(elite_rewards))
 
     new_trajectories: list[Trajectory] = []
     episode_rewards: list[float] = []
+    denom = r_max - r_min if r_max != r_min else 1.0
+    p50_norm = float(np.clip((p50_elite - r_min) / denom, 0.0, 1.0))
     for i in range(config.num_rollout_episodes):
       if i < int(config.num_rollout_episodes * 0.2):
-        rtg_target = r_max  # optimistic: condition on maximum possible return
+        rtg_target = 1.0
       else:
-        rtg_target = float(np_rng.uniform(p50_elite, p100_elite))
+        rtg_target = float(np_rng.uniform(p50_norm, 1.0))
       traj, _ = rollout_episode(
         model_eval, env, rtg_target, config.temperature, r_min, r_max, np_rng
       )
       new_trajectories.append(traj)
       episode_rewards.append(traj.total_reward)
 
-    # Phase 5: Append, sort, cull
-    buffer.add_batch(new_trajectories)
-    buffer.cull(config.cull_fraction)
+    # Phase 5: Append and sort
+    buffer.add_batch(new_trajectories, np_rng=np_rng, random_eviction_fraction=config.random_eviction_fraction, discard_previous=config.discard_previous)
 
     # Update plots
+    elite_cutoff = float(np.min(elite_rewards))
+    plotter.update_loss_curve(losses)
+    plotter.update_losses(iteration, losses)
     plotter.update_rewards(iteration, episode_rewards)
-    plotter.update_distribution(buffer.get_total_rewards())
+    plotter.update_distribution(buffer.get_total_rewards(), elite_cutoff=elite_cutoff, p50_elite=p50_elite)
 
     mean_ep = float(np.mean(episode_rewards))
     print(
