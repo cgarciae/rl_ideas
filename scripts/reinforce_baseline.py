@@ -8,6 +8,7 @@ import flax.nnx as nnx
 import optax
 import numpy as np
 import os
+import tyro
 import moviepy.video.io.ImageSequenceClip as ImageSequenceClip_module
 import matplotlib.pyplot as plt
 
@@ -24,6 +25,7 @@ class Config:
   eval_num_episodes: int = 1
   hidden_dim: int = 128
   batch_size: int = 500
+  render: bool = True
 
 
 # --- Policy Network ---
@@ -117,13 +119,15 @@ def compute_returns(rewards: List[float], gamma: float) -> np.ndarray:
 
 # --- Live Plotting ---
 class LivePlotter:
-  def __init__(self):
+  def __init__(self, render: bool = True):
+    self.render = render
     self.steps = []
     self.rewards = []
     self.ema_rewards = []
     self.alpha = 0.05
 
-    plt.ion()
+    if render:
+      plt.ion()
     self.fig, self.ax = plt.subplots()
     self.scatter = self.ax.scatter(
       [], [], c="b", alpha=0.3, s=10, label="Episode Reward"
@@ -141,22 +145,18 @@ class LivePlotter:
     self.steps.append(step)
     self.rewards.append(reward)
 
-    # Calculate EMA
     if not self.ema_rewards:
       self.ema_rewards.append(reward)
     else:
       ema = self.alpha * reward + (1 - self.alpha) * self.ema_rewards[-1]
       self.ema_rewards.append(ema)
 
-    # Update scatter plot
-    if len(self.steps) % 20 == 0:
+    if self.render and len(self.steps) % 20 == 0:
       self.scatter.set_offsets(np.c_[self.steps, self.rewards])
 
-      # Update EMA line
       self.ema_line.set_xdata(self.steps)
       self.ema_line.set_ydata(self.ema_rewards)
 
-      # Update limits
       self.ax.set_xlim(0, len(self.steps) + 1)
 
       min_reward = min(self.rewards)
@@ -166,6 +166,18 @@ class LivePlotter:
 
       self.fig.canvas.draw()
       self.fig.canvas.flush_events()
+
+  def save_and_close(self, path: str):
+    self.scatter.set_offsets(np.c_[self.steps, self.rewards])
+    self.ema_line.set_xdata(self.steps)
+    self.ema_line.set_ydata(self.ema_rewards)
+    self.ax.relim()
+    self.ax.autoscale_view()
+    dir_ = os.path.dirname(path)
+    if dir_:
+      os.makedirs(dir_, exist_ok=True)
+    self.fig.savefig(path)
+    plt.close(self.fig)
 
 
 # --- Evaluation ---
@@ -221,7 +233,7 @@ def evaluate(
 
 # --- Main ---
 def main():
-  config = Config()
+  config = tyro.cli(Config)
   np.random.seed(config.seed)
   run_name = f"reinforce_baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
   print(f"Run name: {run_name}")
@@ -237,7 +249,7 @@ def main():
   policy_optimizer = nnx.Optimizer(policy_model, optax.adam(config.learning_rate), wrt=nnx.Param)
   value_optimizer = nnx.Optimizer(value_model, optax.adam(config.learning_rate), wrt=nnx.Param)
   
-  plotter = LivePlotter()
+  plotter = LivePlotter(render=config.render)
 
   print("Starting training...")
   for episode in range(config.num_episodes):
@@ -298,9 +310,8 @@ def main():
       print(f"Eval at episode {episode + 1}: Avg Reward = {avg_reward:.2f}")
 
   env.close()
-  plt.ioff()
-  print("Done. Close the plot window to exit.")
-  plt.show()
+  plotter.save_and_close(f"plots/{run_name}.png")
+  print("Done.")
 
 
 if __name__ == "__main__":

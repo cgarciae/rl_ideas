@@ -13,6 +13,7 @@ dependencies = [
     "moviepy>=2.2.1",
     "numpy>=2.3.5",
     "optax>=0.2.6",
+    "tyro>=0.9.19",
 ]
 
 [tool.ruff]

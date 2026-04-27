@@ -8,6 +8,7 @@ import optax
 import numpy as np
 import os
 import random
+import tyro
 import moviepy.video.io.ImageSequenceClip as ImageSequenceClip_module
 import matplotlib.pyplot as plt
 
@@ -39,6 +40,7 @@ class Config:
   # Eval
   eval_interval: int = 5
   eval_num_episodes: int = 3
+  render: bool = True
 
 
 # --- Trajectory ---
@@ -274,13 +276,15 @@ def evaluate(
 
 # --- Live Plotter ---
 class LivePlotter:
-  def __init__(self):
+  def __init__(self, render: bool = True):
+    self.render = render
     self.iterations_scatter: list[int] = []
     self.rewards_scatter: list[float] = []
     self.ema_per_iter: list[float] = []
     self.alpha = 0.2
 
-    plt.ion()
+    if render:
+      plt.ion()
     self.fig, (self.ax_reward, self.ax_dist) = plt.subplots(1, 2, figsize=(14, 5))
 
     # Left: rollout episode rewards with EMA
@@ -323,8 +327,9 @@ class LivePlotter:
     self.ax_reward.relim()
     self.ax_reward.autoscale_view()
 
-    self.fig.canvas.draw()
-    self.fig.canvas.flush_events()
+    if self.render:
+      self.fig.canvas.draw()
+      self.fig.canvas.flush_events()
 
   def update_distribution(self, total_rewards: np.ndarray):
     self.ax_dist.cla()
@@ -353,13 +358,22 @@ class LivePlotter:
     self.ax_dist.spines["top"].set_visible(False)
     self.ax_dist.spines["right"].set_visible(False)
 
-    self.fig.canvas.draw()
-    self.fig.canvas.flush_events()
+    if self.render:
+      self.fig.canvas.draw()
+      self.fig.canvas.flush_events()
+
+  def save_and_close(self, path: str):
+    self.fig.tight_layout()
+    dir_ = os.path.dirname(path)
+    if dir_:
+      os.makedirs(dir_, exist_ok=True)
+    self.fig.savefig(path)
+    plt.close(self.fig)
 
 
 # --- Main ---
 def main():
-  config = Config()
+  config = tyro.cli(Config)
   np.random.seed(config.seed)
   random.seed(config.seed)
   np_rng = np.random.default_rng(config.seed)
@@ -379,7 +393,7 @@ def main():
   optimizer = nnx.Optimizer(model, optax.adam(config.learning_rate), wrt=nnx.Param)
 
   buffer = SortedBuffer(max_trajectories=config.max_buffer_trajectories)
-  plotter = LivePlotter()
+  plotter = LivePlotter(render=config.render)
 
   # --- Phase 1: Random Data Collection ---
   print(f"Phase 1: Collecting {config.num_random_episodes} random episodes...")
@@ -455,9 +469,8 @@ def main():
       print(f"  → Eval Iter {iteration}: Avg Reward = {avg_reward:.2f}")
 
   env.close()
-  plt.ioff()
-  print("Done. Close the plot window to exit.")
-  plt.show()
+  plotter.save_and_close(f"plots/{run_name}.png")
+  print("Done.")
 
 
 if __name__ == "__main__":
