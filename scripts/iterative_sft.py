@@ -274,7 +274,8 @@ def evaluate(
 
 # --- Live Plotter ---
 class LivePlotter:
-  def __init__(self):
+  def __init__(self, video_dir: str):
+    self.video_dir = video_dir
     self.iterations_scatter: list[int] = []
     self.rewards_scatter: list[float] = []
     self.ema_per_iter: list[float] = []
@@ -320,8 +321,13 @@ class LivePlotter:
     iter_axis = list(range(1, len(self.ema_per_iter) + 1))
     self.ema_line.set_xdata(iter_axis)
     self.ema_line.set_ydata(self.ema_per_iter)
-    self.ax_reward.relim()
-    self.ax_reward.autoscale_view()
+    # relim() doesn't account for scatter offsets, so set limits manually
+    y_min = min(self.rewards_scatter)
+    y_max = max(self.rewards_scatter)
+    y_pad = max(1.0, (y_max - y_min) * 0.05)
+    x_max = max(self.iterations_scatter)
+    self.ax_reward.set_xlim(0, x_max + 1)
+    self.ax_reward.set_ylim(y_min - y_pad, y_max + y_pad)
 
     self.fig.canvas.draw()
     self.fig.canvas.flush_events()
@@ -348,13 +354,14 @@ class LivePlotter:
 
     self.ax_dist.set_xlabel("Total Episode Reward (RTG₀)")
     self.ax_dist.set_ylabel("Count")
-    self.ax_dist.set_title("Buffer RTG Distribution")
+    self.ax_dist.set_title(f"Buffer RTG Distribution (n={len(total_rewards)})")
     self.ax_dist.legend(fontsize=8)
     self.ax_dist.spines["top"].set_visible(False)
     self.ax_dist.spines["right"].set_visible(False)
 
     self.fig.canvas.draw()
     self.fig.canvas.flush_events()
+    self.fig.savefig(os.path.join(self.video_dir, "0_plot.png"), bbox_inches="tight")
 
 
 # --- Main ---
@@ -364,6 +371,8 @@ def main():
   random.seed(config.seed)
   np_rng = np.random.default_rng(config.seed)
   run_name = f"iterative_sft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+  video_dir = f"videos/{run_name}"
+  os.makedirs(video_dir, exist_ok=True)
   print(f"Run name: {run_name}")
 
   env = gym.make(config.env_name)
@@ -379,7 +388,7 @@ def main():
   optimizer = nnx.Optimizer(model, optax.adam(config.learning_rate), wrt=nnx.Param)
 
   buffer = SortedBuffer(max_trajectories=config.max_buffer_trajectories)
-  plotter = LivePlotter()
+  plotter = LivePlotter(video_dir)
 
   # --- Phase 1: Random Data Collection ---
   print(f"Phase 1: Collecting {config.num_random_episodes} random episodes...")
