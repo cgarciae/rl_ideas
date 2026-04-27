@@ -8,6 +8,7 @@ import numpy as np
 from typing import Tuple
 import dataclasses
 from datetime import datetime
+import tyro
 
 
 # --- Configuration ---
@@ -25,6 +26,7 @@ class Config:
   max_dataset_size: int = 200_000  # Maximum dataset size (fixed buffer)
   eval_num_episodes: int = 10  # Number of episodes to evaluate
   target_return: float = 200.0  # Target return for LunarLander
+  render: bool = True
 
 
 # --- 1. Model Definition (RvS MLP) ---
@@ -319,7 +321,7 @@ def evaluate(
 
 
 def main():
-  config = Config()
+  config = tyro.cli(Config)
   run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
   print(f"Run name: {run_name}")
 
