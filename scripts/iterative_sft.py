@@ -35,6 +35,7 @@ class Config:
   percent_training: float = 0.3
   random_eviction_fraction: float = 0.0
   discard_previous: bool = False
+  rtg_encoding_freqs: int = 4  # gives 8-dim RTG embedding: sin+cos at [1, 10, 100, 1000]
   # Phase 5: buffer management
   cull_fraction: float = 0.05
   max_buffer_trajectories: int = 2000
@@ -124,8 +125,6 @@ class SortedBuffer:
   def sample_transitions(
     self,
     batch_size: int,
-    r_min: float,
-    r_max: float,
     np_rng: np.random.Generator,
     top_fraction: float = 1.0,
   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -144,27 +143,33 @@ class SortedBuffer:
       flat_states, flat_actions, flat_rtgs = self._flat_states, self._flat_actions, self._flat_rtgs
     n = len(flat_states)
     indices = np_rng.choice(n, size=batch_size, replace=batch_size > n)
-    denom = r_max - r_min if r_max != r_min else 1.0
-    rtg_norms = np.clip((flat_rtgs[indices] - r_min) / denom, 0.0, 1.0)
-    return flat_states[indices], flat_actions[indices], rtg_norms
+    return flat_states[indices], flat_actions[indices], flat_rtgs[indices]
 
   def __len__(self):
     return len(self.trajectories)
 
 
+def encode_rtg(rtg: jax.Array, num_freqs: int = 4) -> jax.Array:
+    """Sinusoidal encoding of raw RTG. freqs = [10^0, 10^1, ..., 10^(n-1)]"""
+    freqs = jnp.array([10.0 ** i for i in range(num_freqs)])  # (num_freqs,)
+    angles = rtg[..., None] / freqs  # (..., num_freqs)
+    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)  # (..., 2*num_freqs)
+
+
 # --- Policy Network ---
 class PolicyNetwork(nnx.Module):
   def __init__(self, state_dim: int, action_dim: int, config: Config, rngs: nnx.Rngs):
-    self.fc1 = nnx.Linear(state_dim + 1, config.hidden_dim, rngs=rngs)
+    self.num_freqs = config.rtg_encoding_freqs
+    self.fc1 = nnx.Linear(state_dim + 2 * config.rtg_encoding_freqs, config.hidden_dim, rngs=rngs)
     self.drop1 = nnx.Dropout(config.dropout_rate, rngs=rngs)
     self.fc2 = nnx.Linear(config.hidden_dim, config.hidden_dim, rngs=rngs)
     self.drop2 = nnx.Dropout(config.dropout_rate, rngs=rngs)
     self.fc3 = nnx.Linear(config.hidden_dim, action_dim, rngs=rngs)
 
   @nnx.jit
-  def __call__(self, states: jax.Array, rtg_norms: jax.Array) -> jax.Array:
-    # rtg_norms: (batch,) → (batch, 1) for concatenation
-    x = jnp.concatenate([states, rtg_norms[:, None]], axis=-1)
+  def __call__(self, states: jax.Array, rtgs: jax.Array) -> jax.Array:
+    rtg_enc = encode_rtg(rtgs, self.num_freqs)  # (batch, 2*num_freqs)
+    x = jnp.concatenate([states, rtg_enc], axis=-1)
     x = self.drop1(nnx.relu(self.fc1(x)))
     x = self.drop2(nnx.relu(self.fc2(x)))
     return self.fc3(x)
@@ -177,11 +182,11 @@ def train_step(
   optimizer: nnx.Optimizer,
   states: jax.Array,
   actions: jax.Array,
-  rtg_norms: jax.Array,
+  rtgs: jax.Array,
 ):
-  
+
   def loss_fn(model):
-    logits = model(states, rtg_norms)
+    logits = model(states, rtgs)
     return optax.softmax_cross_entropy_with_integer_labels(logits, actions).mean()
 
   loss, grads = jax.value_and_grad(loss_fn, allow_int=True)(model)
@@ -213,21 +218,17 @@ def rollout_episode(
   env: gym.Env,
   rtg_target: float,
   temperature: float,
-  r_min: float,
-  r_max: float,
   np_rng: np.random.Generator,
   render: bool = False,
 ) -> tuple["Trajectory", list]:
   state, _ = env.reset()
   done = False
   states, actions, rewards, frames = [], [], [], []
-  denom = r_max - r_min if r_max != r_min else 1.0
-  rtg_remaining = r_min + rtg_target * denom
+  rtg_remaining = rtg_target
 
   while not done:
-    rtg_norm = float(np.clip((rtg_remaining - r_min) / denom, 0.0, 1.0))
-    state_jax = jnp.array(state, dtype=jnp.float32)[None]   # (1, 8)
-    rtg_jax = jnp.array([rtg_norm], dtype=jnp.float32)       # (1,)
+    state_jax = jnp.array(state, dtype=jnp.float32)[None]       # (1, 8)
+    rtg_jax = jnp.array([rtg_remaining], dtype=jnp.float32)      # (1,)
     logits = np.array(model(state_jax, rtg_jax)[0])
 
     # Numerically stable temperature sampling
@@ -245,8 +246,7 @@ def rollout_episode(
     if render:
       frames.append(env.render())
 
-    # Decrement and clip remaining RTG
-    rtg_remaining = float(np.clip(rtg_remaining - reward, r_min, r_max))
+    rtg_remaining -= reward
     state = next_state
 
   return Trajectory(states=states, actions=actions, rewards=rewards), frames
@@ -258,15 +258,12 @@ def evaluate(
   config: Config,
   run_name: str,
   iteration: int,
-  r_min: float,
-  r_max: float,
   elite_total_rewards: np.ndarray,
 ) -> float:
   env = gym.make(config.env_name, render_mode="rgb_array")
   np_rng = np.random.default_rng(config.seed + iteration * 1000)
 
-  denom = r_max - r_min if r_max != r_min else 1.0
-  rtg_target = float(np.clip((np.max(elite_total_rewards) - r_min) / denom, 0.0, 1.0))
+  rtg_target = float(np.max(elite_total_rewards))
   rewards = []
   best_reward = -float("inf")
   best_frames: list = []
@@ -275,7 +272,6 @@ def evaluate(
     traj, frames = rollout_episode(
       model, env, rtg_target,
       temperature=0.01,
-      r_min=r_min, r_max=r_max,
       np_rng=np_rng, render=True,
     )
     rewards.append(traj.total_reward)
@@ -487,6 +483,7 @@ def main():
   random_trajectories = collect_random_episodes(env, config.num_random_episodes)
   buffer.add_batch(random_trajectories)
   mean_random = float(np.mean([t.total_reward for t in random_trajectories]))
+  global_max_rtg = float(np.max([t.total_reward for t in random_trajectories]))
   print(f"  Random policy mean reward: {mean_random:.2f}")
   plotter.update_distribution(buffer.get_total_rewards())
 
@@ -499,15 +496,15 @@ def main():
     # Phase 3: SFT Training
     losses = []
     for _ in range(config.train_steps_per_iter):
-      states_b, actions_b, rtg_norms_b = buffer.sample_transitions(
-        config.batch_size, r_min, r_max, np_rng, top_fraction=config.percent_training
+      states_b, actions_b, rtgs_b = buffer.sample_transitions(
+        config.batch_size, np_rng, top_fraction=config.percent_training
       )
       loss = train_step(
         model,
         optimizer,
         jnp.array(states_b),
         jnp.array(actions_b),
-        jnp.array(rtg_norms_b),
+        jnp.array(rtgs_b),
       )
       losses.append(float(loss))
     mean_loss = float(np.mean(losses))
@@ -515,18 +512,17 @@ def main():
     # Phase 4: Optimistic Rollout
     elite_rewards = buffer.get_elite_total_rewards(config.elite_fraction)
     p50_elite = float(np.percentile(elite_rewards, 50))
+    p100_elite = float(np.max(elite_rewards))
 
     new_trajectories: list[Trajectory] = []
     episode_rewards: list[float] = []
-    denom = r_max - r_min if r_max != r_min else 1.0
-    p50_norm = float(np.clip((p50_elite - r_min) / denom, 0.0, 1.0))
     for i in range(config.num_rollout_episodes):
       if i < int(config.num_rollout_episodes * 0.2):
-        rtg_target = 1.0
+        rtg_target = p100_elite
       else:
-        rtg_target = float(np_rng.uniform(p50_norm, 1.0))
+        rtg_target = float(np_rng.uniform(p50_elite, p100_elite))
       traj, _ = rollout_episode(
-        model_eval, env, rtg_target, config.temperature, r_min, r_max, np_rng
+        model_eval, env, rtg_target, config.temperature, np_rng
       )
       new_trajectories.append(traj)
       episode_rewards.append(traj.total_reward)
@@ -554,7 +550,7 @@ def main():
     if iteration % config.eval_interval == 0:
       elite_rewards_eval = buffer.get_elite_total_rewards(config.elite_fraction)
       avg_reward = evaluate(
-        model_eval, config, run_name, iteration, r_min, r_max, elite_rewards_eval
+        model_eval, config, run_name, iteration, elite_rewards_eval
       )
       print(f"  → Eval Iter {iteration}: Avg Reward = {avg_reward:.2f}")
 
