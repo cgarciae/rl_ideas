@@ -404,6 +404,7 @@ class LivePlotter:
     total_rewards: np.ndarray,
     elite_cutoff: float | None = None,
     p50_elite: float | None = None,
+    p_train_cutoff: float | None = None,
   ):
     self.ax_dist.cla()
     self.ax_dist.hist(
@@ -429,6 +430,14 @@ class LivePlotter:
         linestyle="--",
         linewidth=1.5,
         label=f"P50 elite={p50_elite:.0f}",
+      )
+    if p_train_cutoff is not None:
+      self.ax_dist.axvline(
+        p_train_cutoff,
+        color="purple",
+        linestyle="--",
+        linewidth=1.5,
+        label=f"p_train={p_train_cutoff:.0f}",
       )
 
     self.ax_dist.set_xlabel("Total Episode Reward (RTG₀)")
@@ -483,7 +492,6 @@ def main():
   random_trajectories = collect_random_episodes(env, config.num_random_episodes)
   buffer.add_batch(random_trajectories)
   mean_random = float(np.mean([t.total_reward for t in random_trajectories]))
-  global_max_rtg = float(np.max([t.total_reward for t in random_trajectories]))
   print(f"  Random policy mean reward: {mean_random:.2f}")
   plotter.update_distribution(buffer.get_total_rewards())
 
@@ -532,10 +540,12 @@ def main():
 
     # Update plots
     elite_cutoff = float(np.min(elite_rewards))
+    n_train = max(1, int(len(buffer) * config.percent_training))
+    p_train_cutoff = float(buffer.get_total_rewards()[n_train - 1])
     plotter.update_loss_curve(losses)
     plotter.update_losses(iteration, losses)
     plotter.update_rewards(iteration, episode_rewards)
-    plotter.update_distribution(buffer.get_total_rewards(), elite_cutoff=elite_cutoff, p50_elite=p50_elite)
+    plotter.update_distribution(buffer.get_total_rewards(), elite_cutoff=elite_cutoff, p50_elite=p50_elite, p_train_cutoff=p_train_cutoff)
 
     mean_ep = float(np.mean(episode_rewards))
     print(
@@ -548,9 +558,8 @@ def main():
 
     # Evaluation
     if iteration % config.eval_interval == 0:
-      elite_rewards_eval = buffer.get_elite_total_rewards(config.elite_fraction)
       avg_reward = evaluate(
-        model_eval, config, run_name, iteration, elite_rewards_eval
+        model_eval, config, run_name, iteration, elite_rewards
       )
       print(f"  → Eval Iter {iteration}: Avg Reward = {avg_reward:.2f}")
 
