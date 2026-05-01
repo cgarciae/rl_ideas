@@ -26,11 +26,12 @@ class Config:
   # Phase 1: initial random seed
   num_random_episodes: int = 200
   # Phase 3: SFT training per iteration
-  train_steps_per_iter: int = 50
+  train_steps_per_iter: int = 200
   dropout_rate: float = 0.1
   # Phase 4: rollout
   num_rollout_episodes: int = 50
-  temperature: float = 1.0
+  temp_schedule: list[float] = dataclasses.field(default_factory=lambda: [1.0, 0.5, 0.1])
+  num_envs: int = 8
   elite_fraction: float = 0.3
   percent_training: float = 0.3
   random_eviction_fraction: float = 0.0
@@ -45,6 +46,12 @@ class Config:
   eval_interval: int = 5
   eval_num_episodes: int = 3
   render: bool = True
+
+
+def get_temperature(iteration: int, num_iterations: int, temp_schedule: list[float]) -> float:
+    n = len(temp_schedule)
+    idx = min(int(iteration / num_iterations * n), n - 1)
+    return temp_schedule[idx]
 
 
 # --- Trajectory ---
@@ -197,21 +204,82 @@ def train_step(
 
 
 # --- Data Collection ---
-def collect_random_episodes(env: gym.Env, num_episodes: int) -> list[Trajectory]:
-  trajectories = []
-  for _ in range(num_episodes):
-    state, _ = env.reset()
-    done = False
-    states, actions, rewards = [], [], []
-    while not done:
-      action = env.action_space.sample()
-      next_state, reward, terminated, truncated, _ = env.step(action)
-      done = terminated or truncated
-      states.append(state.copy())
-      actions.append(int(action))
-      rewards.append(float(reward))
-      state = next_state
-    trajectories.append(Trajectory(states=states, actions=actions, rewards=rewards))
+def collect_random_episodes(env_name: str, num_episodes: int, num_envs: int) -> list[Trajectory]:
+  vec_env = gym.make_vec(env_name, num_envs=num_envs)
+  obs, _ = vec_env.reset()
+  env_states = [[] for _ in range(num_envs)]
+  env_actions = [[] for _ in range(num_envs)]
+  env_rewards = [[] for _ in range(num_envs)]
+  trajectories: list[Trajectory] = []
+
+  while len(trajectories) < num_episodes:
+    actions = np.array([vec_env.single_action_space.sample() for _ in range(num_envs)])
+    next_obs, rewards, terminated, truncated, _ = vec_env.step(actions)
+    dones = terminated | truncated
+    for i in range(num_envs):
+      env_states[i].append(obs[i].copy())
+      env_actions[i].append(int(actions[i]))
+      env_rewards[i].append(float(rewards[i]))
+    obs = next_obs
+    for i in range(num_envs):
+      if dones[i] and len(trajectories) < num_episodes:
+        trajectories.append(Trajectory(states=env_states[i], actions=env_actions[i], rewards=env_rewards[i]))
+        env_states[i], env_actions[i], env_rewards[i] = [], [], []
+
+  vec_env.close()
+  return trajectories[:num_episodes]
+
+
+def collect_rollouts(
+  model: PolicyNetwork,
+  vec_env,
+  num_episodes: int,
+  p50_elite: float,
+  p100_elite: float,
+  temperature: float,
+  np_rng: np.random.Generator,
+) -> list[Trajectory]:
+  num_envs = vec_env.num_envs
+  n_optimistic = int(num_episodes * 0.2)
+  hi = max(p50_elite + 1e-6, p100_elite)
+  rtg_targets = (
+    [p100_elite] * n_optimistic
+    + [float(np_rng.uniform(p50_elite, hi)) for _ in range(num_episodes - n_optimistic)]
+  )
+
+  obs, _ = vec_env.reset()
+  env_states = [[] for _ in range(num_envs)]
+  env_actions = [[] for _ in range(num_envs)]
+  env_rewards = [[] for _ in range(num_envs)]
+  env_rtg = [rtg_targets[i] if i < num_episodes else p100_elite for i in range(num_envs)]
+  next_target_idx = min(num_envs, num_episodes)
+  trajectories: list[Trajectory] = []
+
+  while len(trajectories) < num_episodes:
+    states_jax = jnp.array(obs, dtype=jnp.float32)
+    rtgs_jax = jnp.array(env_rtg, dtype=jnp.float32)
+    logits = np.array(model(states_jax, rtgs_jax))
+    actions = []
+    for l in logits:
+      scaled = (l - l.max()) / temperature
+      probs = np.exp(scaled); probs /= probs.sum()
+      actions.append(int(np_rng.choice(len(probs), p=probs)))
+    next_obs, rewards, terminated, truncated, _ = vec_env.step(np.array(actions))
+    dones = terminated | truncated
+    for i in range(num_envs):
+      env_states[i].append(obs[i].copy())
+      env_actions[i].append(actions[i])
+      env_rewards[i].append(float(rewards[i]))
+      env_rtg[i] -= float(rewards[i])
+    obs = next_obs
+    for i in range(num_envs):
+      if dones[i] and len(trajectories) < num_episodes:
+        trajectories.append(Trajectory(states=env_states[i], actions=env_actions[i], rewards=env_rewards[i]))
+        env_states[i], env_actions[i], env_rewards[i] = [], [], []
+        if next_target_idx < num_episodes:
+          env_rtg[i] = rtg_targets[next_target_idx]
+          next_target_idx += 1
+
   return trajectories
 
 
@@ -474,9 +542,10 @@ def main():
   os.makedirs(video_dir, exist_ok=True)
   print(f"Run name: {run_name}")
 
-  env = gym.make(config.env_name)
+  env = gym.make(config.env_name)  # single env for eval
   state_dim: int = env.observation_space.shape[0]  # 8 for LunarLander
   action_dim: int = env.action_space.n              # 4 for LunarLander
+  vec_env = gym.make_vec(config.env_name, num_envs=config.num_envs)
 
   rngs = nnx.Rngs(config.seed)
 
@@ -491,7 +560,7 @@ def main():
 
   # --- Phase 1: Random Data Collection ---
   print(f"Phase 1: Collecting {config.num_random_episodes} random episodes...")
-  random_trajectories = collect_random_episodes(env, config.num_random_episodes)
+  random_trajectories = collect_random_episodes(config.env_name, config.num_random_episodes, config.num_envs)
   buffer.add_batch(random_trajectories)
   mean_random = float(np.mean([t.total_reward for t in random_trajectories]))
   print(f"  Random policy mean reward: {mean_random:.2f}")
@@ -523,19 +592,12 @@ def main():
     elite_rewards = buffer.get_elite_total_rewards(config.elite_fraction)
     p50_elite = float(np.percentile(elite_rewards, 50))
     p100_elite = float(np.max(elite_rewards))
+    temperature = get_temperature(iteration, config.num_iterations, config.temp_schedule)
 
-    new_trajectories: list[Trajectory] = []
-    episode_rewards: list[float] = []
-    for i in range(config.num_rollout_episodes):
-      if i < int(config.num_rollout_episodes * 0.2):
-        rtg_target = p100_elite
-      else:
-        rtg_target = float(np_rng.uniform(p50_elite, p100_elite))
-      traj, _ = rollout_episode(
-        model_eval, env, rtg_target, config.temperature, np_rng
-      )
-      new_trajectories.append(traj)
-      episode_rewards.append(traj.total_reward)
+    new_trajectories = collect_rollouts(
+      model_eval, vec_env, config.num_rollout_episodes, p50_elite, p100_elite, temperature, np_rng
+    )
+    episode_rewards = [t.total_reward for t in new_trajectories]
 
     # Phase 5: Append and sort
     buffer.add_batch(new_trajectories, np_rng=np_rng, random_eviction_fraction=config.random_eviction_fraction, discard_previous=config.discard_previous)
@@ -555,7 +617,8 @@ def main():
       f"Loss: {mean_loss:.4f} | "
       f"Rollout Mean: {mean_ep:.2f} | "
       f"Buffer: {len(buffer)} trajs | "
-      f"RTG [{r_min:.0f}, {r_max:.0f}]"
+      f"RTG [{r_min:.0f}, {r_max:.0f}] | "
+      f"Temp: {temperature:.2f}"
     )
 
     # Evaluation
