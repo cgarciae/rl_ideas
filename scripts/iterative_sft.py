@@ -87,7 +87,7 @@ class SortedBuffer:
     S = self.max_trajectories - len(self.trajectories)
     if S < N:
       n_to_delete = N - S
-      n_random = round(n_to_delete * random_eviction_fraction)
+      n_random = min(round(n_to_delete * random_eviction_fraction), len(self.trajectories))
       n_worst = n_to_delete - n_random
       if n_random > 0 and np_rng is not None:
         random_indices = set(np_rng.choice(len(self.trajectories), size=n_random, replace=False).tolist())
@@ -96,6 +96,8 @@ class SortedBuffer:
         del self.trajectories[-n_worst:]
     self.trajectories.extend(new_trajectories)
     self.trajectories.sort(key=lambda t: t.total_reward, reverse=True)
+    if len(self.trajectories) > self.max_trajectories:
+      self.trajectories = self.trajectories[:self.max_trajectories]
     self._dirty = True
 
   def _rebuild_flat(self):
