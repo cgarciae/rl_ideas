@@ -35,14 +35,14 @@ class PolicyNetwork(nnx.Module):
     self.fc2 = nnx.Linear(config.hidden_dim, config.hidden_dim, rngs=rngs)
     self.fc3 = nnx.Linear(config.hidden_dim, action_dim, rngs=rngs)
 
-  @jax.jit
+  @nnx.jit
   def __call__(self, x: jax.Array) -> jax.Array:
     x = nnx.relu(self.fc1(x))
     x = nnx.relu(self.fc2(x))
     logits = self.fc3(x)
     return logits
 
-  @jax.jit
+  @nnx.jit
   def sample(self, x: jax.Array, rngs: nnx.Rngs):
     logits = self(x)
     action = rngs.categorical(logits)
@@ -50,7 +50,7 @@ class PolicyNetwork(nnx.Module):
 
 
 # --- Training ---
-@jax.jit
+@nnx.jit
 def train_step(
   model: PolicyNetwork,
   optimizer: nnx.Optimizer,
@@ -68,7 +68,7 @@ def train_step(
     loss = -jnp.mean(action_log_probs * returns)
     return loss
 
-  loss, grads = jax.value_and_grad(loss_fn)(nnx.as_immutable_vars(model))
+  loss, grads = jax.value_and_grad(loss_fn)(model)
   optimizer.update(model, grads)
   return loss
 
@@ -152,7 +152,7 @@ class LivePlotter:
 def evaluate(
   model: PolicyNetwork,
   config: Config,
-  run_name: str,
+  timestamp: str,
   episode: int,
 ) -> float:
   env = gym.make(config.env_name, render_mode="rgb_array")
@@ -187,7 +187,7 @@ def evaluate(
 
   # Save video of best episode
   if best_frames:
-    video_dir = f"videos/{run_name}"
+    video_dir = f"logs/reinforce/{timestamp}"
     os.makedirs(video_dir, exist_ok=True)
     clip = ImageSequenceClip_module.ImageSequenceClip(best_frames, fps=30)
     clip.write_videofile(
@@ -203,12 +203,14 @@ def evaluate(
 def main():
   config = tyro.cli(Config)
   np.random.seed(config.seed)
-  run_name = f"reinforce_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+  model_name = "reinforce"
+  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+  run_name = f"{model_name}_{timestamp}"
   print(f"Run name: {run_name}")
 
   env = gym.make(config.env_name)
 
-  nnx.use_hijax(True)
+  nnx.set_graph_mode(False)
   rngs = nnx.Rngs(config.seed)
 
   model = PolicyNetwork(action_dim=4, config=config, rngs=rngs)
@@ -268,11 +270,11 @@ def main():
 
     # Evaluation
     if (episode + 1) % config.eval_interval == 0:
-      avg_reward = evaluate(model, config, run_name, episode + 1)
+      avg_reward = evaluate(model, config, timestamp, episode + 1)
       print(f"Eval at episode {episode + 1}: Avg Reward = {avg_reward:.2f}")
 
   env.close()
-  plotter.save_and_close(f"plots/{run_name}.png")
+  plotter.save_and_close(f"logs/{run_name}/plot.png")
   print("Done.")
 
 

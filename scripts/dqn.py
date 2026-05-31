@@ -186,7 +186,7 @@ class LivePlotter:
 def evaluate(
   model: QNetwork,
   config: Config,
-  run_name: str,
+  timestamp: str,
   episode: int,
 ) -> float:
   env = gym.make(config.env_name, render_mode="rgb_array")
@@ -221,7 +221,7 @@ def evaluate(
 
   # Save video of best episode
   if best_frames:
-    video_dir = f"videos/{run_name}"
+    video_dir = f"logs/dqn/{timestamp}"
     os.makedirs(video_dir, exist_ok=True)
     clip = ImageSequenceClip_module.ImageSequenceClip(best_frames, fps=30)
     clip.write_videofile(
@@ -237,7 +237,9 @@ def evaluate(
 def main():
   config = tyro.cli(Config)
   np.random.seed(config.seed)
-  run_name = f"dqn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+  model_name = "dqn"
+  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+  run_name = f"{model_name}_{timestamp}"
   print(f"Run name: {run_name}")
 
   env = gym.make(config.env_name)
@@ -316,11 +318,11 @@ def main():
 
     # Evaluation
     if (episode + 1) % config.eval_interval == 0:
-      avg_reward = evaluate(online_net, config, run_name, episode + 1)
+      avg_reward = evaluate(online_net, config, timestamp, episode + 1)
       print(f"Eval at episode {episode + 1}: Avg Reward = {avg_reward:.2f}")
 
   env.close()
-  plotter.save_and_close(f"plots/{run_name}.png")
+  plotter.save_and_close(f"logs/{run_name}/plot.png")
   print("Done.")
 
 

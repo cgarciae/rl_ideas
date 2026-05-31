@@ -42,12 +42,15 @@ class PolicyNetwork(nnx.Module):
     logits = self.fc3(x)
     return logits
 
-  @jax.jit
-  def sample(self, x: jax.Array, rngs: nnx.Rngs):
-    logits = self(x)
-    action = rngs.categorical(logits)
-    return action
 
+def sample(model, rngs: nnx.Rngs, x: jax.Array):
+  logits = model(x)
+  action = rngs.categorical(logits)
+  return action
+
+def forward(model, x: jax.Array):
+  logits = model(x)
+  return logits
 
 # --- Value Network ---
 class ValueNetwork(nnx.Module):
@@ -56,7 +59,7 @@ class ValueNetwork(nnx.Module):
     self.fc2 = nnx.Linear(config.hidden_dim, config.hidden_dim, rngs=rngs)
     self.fc3 = nnx.Linear(config.hidden_dim, 1, rngs=rngs)
 
-  @jax.jit
+  @nnx.jit
   def __call__(self, x: jax.Array) -> jax.Array:
     x = nnx.relu(self.fc1(x))
     x = nnx.relu(self.fc2(x))
@@ -65,7 +68,7 @@ class ValueNetwork(nnx.Module):
 
 
 # --- Training ---
-@jax.jit
+
 def train_step(
   policy_model: PolicyNetwork,
   value_model: ValueNetwork,
@@ -90,7 +93,7 @@ def train_step(
     loss = -jnp.mean(action_log_probs * advantages)
     return loss
 
-  policy_loss, policy_grads = jax.value_and_grad(policy_loss_fn)(nnx.as_immutable_vars(policy_model))
+  policy_loss, policy_grads = jax.value_and_grad(policy_loss_fn)(policy_model)
   policy_optimizer.update(policy_model, policy_grads)
 
   # Value Update
@@ -99,7 +102,7 @@ def train_step(
     loss = jnp.mean((values - returns) ** 2)
     return loss
 
-  value_loss, value_grads = jax.value_and_grad(value_loss_fn)(nnx.as_immutable_vars(value_model))
+  value_loss, value_grads = jax.value_and_grad(value_loss_fn)(value_model)
   value_optimizer.update(value_model, value_grads)
 
   return policy_loss, value_loss
@@ -182,9 +185,9 @@ class LivePlotter:
 
 # --- Evaluation ---
 def evaluate(
-  model: PolicyNetwork,
+  forward_jit,
   config: Config,
-  run_name: str,
+  timestamp: str,
   episode: int,
 ) -> float:
   env = gym.make(config.env_name, render_mode="rgb_array")
@@ -200,7 +203,7 @@ def evaluate(
 
     while not done:
       state_jax = jnp.array(state)[None, ...]
-      logits = model(state_jax)
+      logits = forward_jit(state_jax)
       action = logits.argmax(axis=-1).item()  # Greedy action for evaluation
 
       next_state, reward, terminated, truncated, _ = env.step(action)
@@ -219,7 +222,7 @@ def evaluate(
 
   # Save video of best episode
   if best_frames:
-    video_dir = f"videos/{run_name}"
+    video_dir = f"logs/reinforce_baseline/{timestamp}"
     os.makedirs(video_dir, exist_ok=True)
     clip = ImageSequenceClip_module.ImageSequenceClip(best_frames, fps=30)
     clip.write_videofile(
@@ -235,12 +238,14 @@ def evaluate(
 def main():
   config = tyro.cli(Config)
   np.random.seed(config.seed)
-  run_name = f"reinforce_baseline_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+  model_name = "reinforce_baseline"
+  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+  run_name = f"{model_name}_{timestamp}"
   print(f"Run name: {run_name}")
 
   env = gym.make(config.env_name)
 
-  nnx.use_hijax(True)
+  nnx.set_graph_mode(False)
   rngs = nnx.Rngs(config.seed)
 
   policy_model = PolicyNetwork(action_dim=4, config=config, rngs=rngs)
@@ -248,6 +253,10 @@ def main():
   
   policy_optimizer = nnx.Optimizer(policy_model, optax.adam(config.learning_rate), wrt=nnx.Param)
   value_optimizer = nnx.Optimizer(value_model, optax.adam(config.learning_rate), wrt=nnx.Param)
+
+  train_step_jit = nnx.jit_partial(train_step, policy_model, value_model, policy_optimizer, value_optimizer)
+  sample_jit = nnx.jit_partial(sample, policy_model, rngs)
+  forward_jit = nnx.jit_partial(forward, policy_model)
   
   plotter = LivePlotter(render=config.render)
 
@@ -263,7 +272,7 @@ def main():
     # Collect trajectory
     while not done:
       # Sample action
-      action = policy_model.sample(state, rngs).item()
+      action = sample_jit(state).item()
 
       next_state, reward, terminated, truncated, _ = env.step(action)
       done = terminated or truncated
@@ -291,8 +300,7 @@ def main():
       actions_jax = actions_jax[indices]
       returns_jax = returns_jax[indices]
 
-      policy_loss, value_loss = train_step(
-          policy_model, value_model, policy_optimizer, value_optimizer, 
+      policy_loss, value_loss = train_step_jit(
           states_jax, actions_jax, returns_jax
       )
     else:
@@ -306,11 +314,11 @@ def main():
 
     # Evaluation
     if (episode + 1) % config.eval_interval == 0:
-      avg_reward = evaluate(policy_model, config, run_name, episode + 1)
+      avg_reward = evaluate(forward_jit, config, timestamp, episode + 1)
       print(f"Eval at episode {episode + 1}: Avg Reward = {avg_reward:.2f}")
 
   env.close()
-  plotter.save_and_close(f"plots/{run_name}.png")
+  plotter.save_and_close(f"logs/{run_name}/plot.png")
   print("Done.")
 
 

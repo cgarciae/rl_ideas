@@ -39,7 +39,8 @@ class Config:
   rtg_encoding_freqs: int = 4  # gives 8-dim RTG embedding: sin+cos at [1, 10, 100, 1000]
   # Phase 5: buffer management
   cull_fraction: float = 0.05
-  max_buffer_trajectories: int = 2000
+  max_buffer_trajectories: int = 100_000
+  max_trajectory_reuse: int | None = None
   # Main loop
   num_iterations: int = 500
   # Eval
@@ -50,8 +51,14 @@ class Config:
 
 def get_temperature(iteration: int, num_iterations: int, temp_schedule: list[float]) -> float:
     n = len(temp_schedule)
-    idx = min(int(iteration / num_iterations * n), n - 1)
-    return temp_schedule[idx]
+    if n == 1:
+        return temp_schedule[0]
+    pos = (iteration / max(num_iterations - 1, 1)) * (n - 1)
+    idx = int(pos)
+    frac = pos - idx
+    if idx >= n - 1:
+        return temp_schedule[-1]
+    return temp_schedule[idx] * (1 - frac) + temp_schedule[idx + 1] * frac
 
 
 # --- Trajectory ---
@@ -61,6 +68,7 @@ class Trajectory:
   actions: list[int]
   rewards: list[float]
   rtgs: list[float] = dataclasses.field(default_factory=list)
+  use_count: int = dataclasses.field(default=0)
 
   def __post_init__(self):
     if not self.rtgs:
@@ -123,6 +131,17 @@ class SortedBuffer:
   def get_normalization_stats(self) -> tuple[float, float]:
     self._rebuild_flat()
     return float(self._flat_rtgs.min()), float(self._flat_rtgs.max())
+
+  def tick_and_expire(self, max_reuse: int | None):
+    """Increment use_count for all trajectories and remove those exceeding max_reuse."""
+    if max_reuse is None:
+      return
+    for t in self.trajectories:
+      t.use_count += 1
+    before = len(self.trajectories)
+    self.trajectories = [t for t in self.trajectories if t.use_count <= max_reuse]
+    if len(self.trajectories) != before:
+      self._dirty = True
 
   def get_total_rewards(self) -> np.ndarray:
     return np.array([t.total_reward for t in self.trajectories])
@@ -326,7 +345,7 @@ def rollout_episode(
 def evaluate(
   model: PolicyNetwork,
   config: Config,
-  run_name: str,
+  timestamp: str,
   iteration: int,
   elite_total_rewards: np.ndarray,
 ) -> float:
@@ -352,7 +371,7 @@ def evaluate(
   env.close()
 
   if best_frames:
-    video_dir = f"videos/{run_name}"
+    video_dir = f"logs/iterative_sft/{timestamp}"
     os.makedirs(video_dir, exist_ok=True)
     clip = ImageSequenceClip_module.ImageSequenceClip(best_frames, fps=30)
     clip.write_videofile(
@@ -381,9 +400,7 @@ class LivePlotter:
     (self.ax_loss, self.ax_curve) = axes[1]
 
     # Upper-left: rollout episode rewards with EMA
-    self.scatter = self.ax_reward.scatter(
-      [], [], c="b", alpha=0.3, s=10, label="Episode Reward"
-    )
+    self.scatter = self.ax_reward.scatter([], [], c="b", alpha=0.3, s=10, label="Episode Reward")
     (self.ema_line,) = self.ax_reward.plot([], [], "k", linewidth=2, label="EMA")
     self.ax_reward.set_xlabel("Iteration")
     self.ax_reward.set_ylabel("Reward")
@@ -444,20 +461,15 @@ class LivePlotter:
   def update_rewards(self, iteration: int, episode_rewards: list[float]):
     self.iterations_scatter.extend([iteration] * len(episode_rewards))
     self.rewards_scatter.extend(episode_rewards)
-
     mean_r = float(np.mean(episode_rewards))
     if not self.ema_per_iter:
       self.ema_per_iter.append(mean_r)
     else:
-      self.ema_per_iter.append(
-        self.alpha * mean_r + (1 - self.alpha) * self.ema_per_iter[-1]
-      )
-
+      self.ema_per_iter.append(self.alpha * mean_r + (1 - self.alpha) * self.ema_per_iter[-1])
     self.scatter.set_offsets(np.c_[self.iterations_scatter, self.rewards_scatter])
     iter_axis = list(range(1, len(self.ema_per_iter) + 1))
     self.ema_line.set_xdata(iter_axis)
     self.ema_line.set_ydata(self.ema_per_iter)
-    # relim() doesn't account for scatter offsets, so set limits manually
     y_min = min(self.rewards_scatter)
     y_max = max(self.rewards_scatter)
     y_pad = max(1.0, (y_max - y_min) * 0.05)
@@ -477,39 +489,15 @@ class LivePlotter:
     p_train_cutoff: float | None = None,
   ):
     self.ax_dist.cla()
-    self.ax_dist.hist(
-      total_rewards, bins=50, color="steelblue", alpha=0.7, edgecolor="none"
-    )
-
+    self.ax_dist.hist(total_rewards, bins=50, color="steelblue", alpha=0.7, edgecolor="none")
     p_max = float(np.max(total_rewards))
-    self.ax_dist.axvline(
-      p_max, color="green", linestyle="--", linewidth=1.5, label=f"Max={p_max:.0f}"
-    )
+    self.ax_dist.axvline(p_max, color="green", linestyle="--", linewidth=1.5, label=f"Max={p_max:.0f}")
     if elite_cutoff is not None:
-      self.ax_dist.axvline(
-        elite_cutoff,
-        color="orange",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"Elite cutoff={elite_cutoff:.0f}",
-      )
+      self.ax_dist.axvline(elite_cutoff, color="orange", linestyle="--", linewidth=1.5, label=f"Elite={elite_cutoff:.0f}")
     if p50_elite is not None:
-      self.ax_dist.axvline(
-        p50_elite,
-        color="red",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"P50 elite={p50_elite:.0f}",
-      )
+      self.ax_dist.axvline(p50_elite, color="red", linestyle="--", linewidth=1.5, label=f"P50e={p50_elite:.0f}")
     if p_train_cutoff is not None:
-      self.ax_dist.axvline(
-        p_train_cutoff,
-        color="purple",
-        linestyle="--",
-        linewidth=1.5,
-        label=f"p_train={p_train_cutoff:.0f}",
-      )
-
+      self.ax_dist.axvline(p_train_cutoff, color="purple", linestyle="--", linewidth=1.5, label=f"p_train={p_train_cutoff:.0f}")
     self.ax_dist.set_xlabel("Total Episode Reward (RTG₀)")
     self.ax_dist.set_ylabel("Count")
     self.ax_dist.set_title(f"Buffer RTG Distribution (n={len(total_rewards)})")
@@ -520,7 +508,7 @@ class LivePlotter:
     if self.render:
       self.fig.canvas.draw()
       self.fig.canvas.flush_events()
-    self.fig.savefig(os.path.join(self.video_dir, "0_plot.png"), bbox_inches="tight")
+    self.fig.savefig(os.path.join(self.video_dir, "plot.png"), bbox_inches="tight")
 
   def save_and_close(self, path: str):
     self.fig.tight_layout()
@@ -537,8 +525,12 @@ def main():
   np.random.seed(config.seed)
   random.seed(config.seed)
   np_rng = np.random.default_rng(config.seed)
-  run_name = f"iterative_sft_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-  video_dir = f"videos/{run_name}"
+  model_name = "iterative_sft"
+  timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+  run_name = f"{model_name}_{timestamp}"
+  plot_dir = f"logs/{run_name}"
+  video_dir = f"logs/{model_name}/{timestamp}"
+  os.makedirs(plot_dir, exist_ok=True)
   os.makedirs(video_dir, exist_ok=True)
   print(f"Run name: {run_name}")
 
@@ -556,7 +548,7 @@ def main():
   optimizer = nnx.Optimizer(model, optax.adam(config.learning_rate), wrt=nnx.Param)
 
   buffer = SortedBuffer(max_trajectories=config.max_buffer_trajectories)
-  plotter = LivePlotter(video_dir, render=config.render)
+  plotter = LivePlotter(plot_dir, render=config.render)
 
   # --- Phase 1: Random Data Collection ---
   print(f"Phase 1: Collecting {config.num_random_episodes} random episodes...")
@@ -588,6 +580,10 @@ def main():
       losses.append(float(loss))
     mean_loss = float(np.mean(losses))
 
+    len_before = len(buffer)
+    buffer.tick_and_expire(config.max_trajectory_reuse)
+    n_expired = len_before - len(buffer)
+
     # Phase 4: Optimistic Rollout
     elite_rewards = buffer.get_elite_total_rewards(config.elite_fraction)
     p50_elite = float(np.percentile(elite_rewards, 50))
@@ -617,6 +613,7 @@ def main():
       f"Loss: {mean_loss:.4f} | "
       f"Rollout Mean: {mean_ep:.2f} | "
       f"Buffer: {len(buffer)} trajs | "
+      f"Expired: {n_expired} | "
       f"RTG [{r_min:.0f}, {r_max:.0f}] | "
       f"Temp: {temperature:.2f}"
     )
@@ -624,12 +621,12 @@ def main():
     # Evaluation
     if iteration % config.eval_interval == 0:
       avg_reward = evaluate(
-        model_eval, config, run_name, iteration, elite_rewards
+        model_eval, config, timestamp, iteration, elite_rewards
       )
       print(f"  → Eval Iter {iteration}: Avg Reward = {avg_reward:.2f}")
 
   env.close()
-  plotter.save_and_close(f"plots/{run_name}.png")
+  plotter.save_and_close(f"logs/{run_name}/plot.png")
   print("Done.")
 
 

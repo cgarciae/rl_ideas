@@ -252,7 +252,7 @@ def evaluate(
   state_mean,
   state_std,
   rtg_scale,
-  run_name: str,
+  timestamp: str,
   step: int,
 ):
   """Evaluate the model and save video of the best episode."""
@@ -305,7 +305,7 @@ def evaluate(
   import os
   import moviepy.video.io.ImageSequenceClip as ImageSequenceClip_module
 
-  video_dir = f"videos/{run_name}/step_{step}"
+  video_dir = f"logs/supervised_rl/{timestamp}/step_{step}"
   os.makedirs(video_dir, exist_ok=True)
 
   clip = ImageSequenceClip_module.ImageSequenceClip(best_frames, fps=30)
@@ -322,7 +322,8 @@ def evaluate(
 
 def main():
   config = tyro.cli(Config)
-  run_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+  timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+  run_name = timestamp
   print(f"Run name: {run_name}")
 
   # 1. Collect Data
@@ -357,7 +358,7 @@ def main():
 
     if (step + 1) % config.eval_interval == 0:
       avg_reward = evaluate(
-        forward, config, s_mean, s_std, r_scale, run_name, step + 1
+        forward, config, s_mean, s_std, r_scale, timestamp, step + 1
       )
       print(f"Eval at step {step + 1}: Avg Reward = {avg_reward:.2f}")
 
